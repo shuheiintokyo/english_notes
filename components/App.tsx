@@ -11,29 +11,16 @@ function formatDate(iso: string) {
   return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
 }
 
-function calculateStreak(notesList: LocalNote[]): number {
-  if (notesList.length === 0) return 0;
-  const dates = Array.from(new Set(notesList.map(n => n.created_at.split('T')[0])))
-    .sort((a, b) => new Date(b).getTime() - new Date(a).getTime());
-  if (dates.length === 0) return 0;
+type Provider = 'gemini' | 'claude';
 
-  const todayStr = new Date().toISOString().split('T')[0];
-  const yesterdayStr = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-  if (dates[0] !== todayStr && dates[0] !== yesterdayStr) return 0;
-
-  let streak = 0;
-  let expectedDate = new Date(dates[0]);
-  for (const dateStr of dates) {
-    const currentDate = new Date(dateStr);
-    const diffDays = Math.round((expectedDate.getTime() - currentDate.getTime()) / 86400000);
-    if (diffDays === 0) {
-      streak++;
-      expectedDate.setDate(expectedDate.getDate() - 1);
-    } else {
-      break;
-    }
-  }
-  return streak;
+function OnlineDot({ online, onToggle }: { online: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      aria-label={online ? 'オンライン（タップでオフラインに切替）' : 'オフライン（タップでオンラインに切替）'}
+      className={`w-5 h-5 rounded-full border transition ${online ? 'bg-emerald-500 border-emerald-500' : 'bg-slate-300 border-slate-300'}`}
+    />
+  );
 }
 
 export default function App() {
@@ -46,10 +33,10 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [view, setView] = useState<'list' | 'editor'>('list');
   const [searchQuery, setSearchQuery] = useState('');
+  const [provider, setProvider] = useState<Provider>('gemini');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const selected = notes.find(n => n.localId === selectedId) || null;
-  const streak = calculateStreak(notes);
 
   const filteredNotes = notes.filter(n =>
     n.original_text.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -97,6 +84,7 @@ export default function App() {
     setSelectedId(null);
     setDraft('');
     setTab('corrected');
+    setProvider('gemini');
     setView('editor');
     setTimeout(() => textareaRef.current?.focus(), 50);
   };
@@ -113,8 +101,16 @@ export default function App() {
     setSelectedId(id);
     setDraft(n.original_text);
     setTab(n.status === 'reviewed' ? 'corrected' : 'original');
+    setProvider((n.provider as Provider) || 'gemini');
     setView('editor');
     window.scrollTo(0,0);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      e.preventDefault();
+      handleSave();
+    }
   };
 
   const handleSave = async () => {
@@ -122,7 +118,7 @@ export default function App() {
     const now = new Date().toISOString();
     let note: LocalNote;
     if (selected) {
-      note = { ...selected, original_text: draft, created_at: selected.created_at, dirty: true, status: 'pending' as const, corrected_text: undefined, explanation_ja: undefined, reviewed_at: null };
+      note = { ...selected, original_text: draft, created_at: selected.created_at, dirty: true, status: 'pending' as const, corrected_text: undefined, explanation_ja: undefined, reviewed_at: null, provider };
     } else {
       note = {
         localId: uid(),
@@ -131,21 +127,15 @@ export default function App() {
         created_at: now,
         reviewed_at: null,
         dirty: true,
+        provider,
       };
     }
     await saveLocal(note);
     await load();
     setSelectedId(note.localId);
-    showToast('保存しました - オフラインでもOK');
+    showToast('アップロードしました - オフラインでもOK');
     if (online) {
       triggerReview(note);
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-      e.preventDefault();
-      handleSave();
     }
   };
 
@@ -158,7 +148,11 @@ export default function App() {
       const res = await fetch('/api/review', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ original_text: note.original_text, created_at: note.created_at }),
+        body: JSON.stringify({
+          original_text: note.original_text,
+          created_at: note.created_at,
+          provider: note.provider || 'gemini',
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'review failed');
@@ -198,6 +192,19 @@ export default function App() {
   const handleDelete = async () => {
     if (!selected) return;
     if (!confirm('このノートを削除しますか？')) return;
+
+    if (selected.remoteId) {
+      try {
+        await fetch('/api/notes', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ remoteId: selected.remoteId }),
+        });
+      } catch (e) {
+        console.error('remote delete failed', e);
+      }
+    }
+
     await deleteLocal(selected.localId);
     await load();
     setSelectedId(null);
@@ -223,23 +230,13 @@ export default function App() {
                 <h1 className="font-bold text-[17px] tracking-tight">英語添削ノート</h1>
                 <p className="text-[11px] text-slate-500 -mt-0.5">書いて、後で学ぶ</p>
               </div>
-              <div className="flex items-center gap-2">
-                {streak > 0 && (
-                  <span className="text-[10px] px-2 py-1 rounded-full font-medium bg-amber-50 text-amber-700 border border-amber-200 flex items-center gap-1">
-                    🔥 {streak}日連続!
-                  </span>
-                )}
-                <span className={`text-[10px] px-2 py-1 rounded-full font-medium ${online ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500 border'}`}>
-                  {online ? '● オンライン' : '○ オフライン'}
-                </span>
-                <button onClick={() => setOnline(!online)} className="text-[10px] px-2 py-1 rounded-full border bg-white">切替(デモ)</button>
-              </div>
+              <OnlineDot online={online} onToggle={() => setOnline(!online)} />
             </>
           ) : (
             <>
               <button onClick={handleBack} className="text-[14px] font-medium text-slate-600">← 一覧</button>
-              <div className="flex items-center gap-2">
-                <span className={`text-[10px] px-2 py-1 rounded-full ${online ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{online ? 'オンライン' : 'オフライン'}</span>
+              <div className="flex items-center gap-3">
+                <OnlineDot online={online} onToggle={() => setOnline(!online)} />
                 {selected && <button onClick={handleDelete} className="text-[12px] text-red-500 px-2 py-1 rounded-full border border-red-200">削除</button>}
               </div>
             </>
@@ -325,8 +322,22 @@ export default function App() {
               </div>
             </div>
 
-            <div className="mt-4 space-y-2.5">
-              <button onClick={handleSave} disabled={!draft.trim()} className={`w-full h-12 rounded-full font-semibold text-[15px] flex items-center justify-center gap-2 transition ${!draft.trim() ? 'bg-slate-100 text-slate-400' : 'bg-indigo-600 text-white shadow-[0_4px_16px_rgba(79,70,229,0.25)] hover:bg-indigo-700 active:scale-[0.98]'}`}>保存する</button>
+            {/* Teacher/provider picker — scaffolding for future multi-model support */}
+            <div className="mt-3 flex items-center justify-between px-1">
+              <label className="text-[12px] text-slate-500">先生を選ぶ</label>
+              <select
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value as Provider)}
+                  className="text-[12px] border border-slate-200 rounded-lg px-2 py-1 bg-white text-slate-700"
+                >
+                  <option value="gemini">Gemini 3.1 Flash Lite（無料・さくっと）</option>
+                  <option value="claude" disabled>Claude（有料・しっかり／準備中）</option>
+                </select>
+            </div>
+
+            <div className="mt-4 space-y-2">
+              <p className="text-[11px] text-slate-400 text-center">AIの先生が英文を添削して、日本語で解説します</p>
+              <button onClick={handleSave} disabled={!draft.trim()} className={`w-full h-12 rounded-full font-semibold text-[15px] flex items-center justify-center gap-2 transition ${!draft.trim() ? 'bg-slate-100 text-slate-400' : 'bg-indigo-600 text-white shadow-[0_4px_16px_rgba(79,70,229,0.25)] hover:bg-indigo-700 active:scale-[0.98]'}`}>アップロードして添削してもらう</button>
               {selected && selected.status==='pending' && !online && (
                 <div className="rounded-xl bg-slate-50 border border-slate-200 px-3.5 py-3 flex gap-2.5">
                   <span className="text-slate-400">◍</span>
@@ -359,7 +370,7 @@ export default function App() {
                 <div className="pt-4">
                   {tab==='corrected' && (
                     <div>
-                      {!selected ? <div className="rounded-2xl border border-dashed border-slate-200 p-6 text-center text-[13px] text-slate-500">保存すると、ここに添削文が表示されます</div> :
+                      {!selected ? <div className="rounded-2xl border border-dashed border-slate-200 p-6 text-center text-[13px] text-slate-500">アップロードすると、ここに添削文が表示されます</div> :
                        selected.status==='pending' ? <div className="rounded-2xl bg-slate-50 border p-5 text-center"><p className="text-[13px] text-slate-600">レビュー待ちです</p><p className="text-[11px] text-slate-400 mt-1">接続後に自動で処理されます</p></div> :
                        selected.status==='reviewing' ? <div className="rounded-2xl bg-amber-50 border border-amber-200 p-5"><div className="flex items-center gap-3"><div className="w-5 h-5 border-2 border-amber-400 border-t-transparent rounded-full animate-spin"/><p className="text-[13px] font-medium text-amber-800">コーチが確認中...</p></div><p className="text-[11px] text-amber-700/70 mt-2">通常1-2秒で完了します</p></div> :
                        <div className="space-y-3">

@@ -58,3 +58,18 @@ export async function listNotes() {
   const data = await res.json();
   return data.list as NocoRow[];
 }
+
+export async function deleteNote(id: number) {
+  const { url, token, tableId } = getConfig();
+  const res = await fetch(`${url}/api/v2/tables/${tableId}/records`, {
+    method: 'DELETE',
+    headers: { 'xc-token': token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ Id: id }),
+    cache: 'no-store',
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`NocoDB delete failed ${res.status}: ${t}`);
+  }
+  return res.json();
+}
